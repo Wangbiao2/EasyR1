@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 from datasets import load_dataset
+from jinja2 import Template
 from PIL import Image
 from PIL.Image import Image as ImageObject
 from torch.utils.data import Dataset
@@ -90,9 +91,10 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         image_key: str = "images",
         max_prompt_length: int = 1024,
         truncation: str = "error",
-        format_prompt: str = None,
-        max_pixels: int = None,
-        min_pixels: int = None,
+        format_prompt: Optional[str] = None,
+        max_pixels: Optional[int] = None,
+        min_pixels: Optional[int] = None,
+        filter_overlong_prompts: bool = True,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -101,9 +103,9 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         self.image_key = image_key
         self.max_prompt_length = max_prompt_length
         self.truncation = truncation
-        self.format_prompt = format_prompt
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
+        self.filter_overlong_prompts = filter_overlong_prompts
 
         if "@" in data_path:
             data_path, data_split = data_path.split("@")
@@ -111,22 +113,29 @@ class RLHFDataset(Dataset, ImageProcessMixin):
             data_split = "train"
 
         if os.path.isdir(data_path):
+            # when we use dataset builder, we should always refer to the train split
             self.dataset = load_dataset("parquet", data_dir=data_path, split="train")
         elif os.path.isfile(data_path):
             self.dataset = load_dataset("parquet", data_files=data_path, split="train")
-        else:  # remote dataset
+        else:
+            # load remote dataset from huggingface hub
             self.dataset = load_dataset(data_path, split=data_split)
 
-    def __len__(self):
-        return len(self.dataset)
+        self.format_prompt = None
+        if format_prompt:
+            with open(format_prompt, encoding="utf-8") as f:
+                self.format_prompt = f.read()
 
-    def __getitem__(self, index):
-        row_dict: dict = self.dataset[index]
-        prompt_str: str = row_dict[self.prompt_key]
+        if self.filter_overlong_prompts:
+            self.dataset = self.dataset.filter(self._filter_overlong_prompts, desc="Filtering overlong prompts")
+
+    def _get_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
+        prompt_str: str = example[self.prompt_key]
         if self.format_prompt:
-            prompt_str = prompt_str + " " + self.format_prompt.strip()
+            format_prompt = Template(self.format_prompt.strip())
+            prompt_str = format_prompt.render(content=prompt_str)
 
-        if self.image_key in row_dict:
+        if self.image_key in example:
             # https://huggingface.co/docs/transformers/en/tasks/image_text_to_text
             content_list = []
             for i, content in enumerate(prompt_str.split("<image>")):
@@ -136,16 +145,33 @@ class RLHFDataset(Dataset, ImageProcessMixin):
                 if content:
                     content_list.append({"type": "text", "text": content})
 
-            messages = [{"role": "user", "content": content_list}]
+            return [{"role": "user", "content": content_list}]
+        else:
+            return [{"role": "user", "content": prompt_str}]
+
+    def _filter_overlong_prompts(self, example: Dict[str, Any]) -> bool:
+        messages = self._get_messages(example)
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        return (
+            len(processing_class.apply_chat_template(messages, add_generation_prompt=True)) <= self.max_prompt_length
+        )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        example: dict = self.dataset[index]
+        messages = self._get_messages(example)
+
+        if self.image_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            images = [self.process_image(image) for image in row_dict.pop(self.image_key)]
+            images = [self.process_image(image) for image in example.pop(self.image_key)]
             model_inputs = self.processor(images, [prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
-            row_dict["multi_modal_data"] = {"image": images}
-            row_dict["multi_modal_inputs"] = dict(model_inputs)
+            example["multi_modal_data"] = {"image": images}
+            example["multi_modal_inputs"] = dict(model_inputs)
         else:
-            messages = [{"role": "user", "content": prompt_str}]
             prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
@@ -171,9 +197,18 @@ class RLHFDataset(Dataset, ImageProcessMixin):
             left_pad=True,
             truncation=self.truncation,
         )
-        row_dict["input_ids"] = input_ids
-        row_dict["attention_mask"] = attention_mask
-        row_dict["position_ids"] = position_ids
-        row_dict["raw_prompt_ids"] = self.tokenizer.encode(prompt, add_special_tokens=False)
-        row_dict["ground_truth"] = row_dict.pop(self.answer_key)
-        return row_dict
+        raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.max_prompt_length:
+            if self.truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[..., -self.max_prompt_length :]
+            elif self.truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[..., : self.max_prompt_length]
+            elif self.truncation == "error":
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+
+        example["input_ids"] = input_ids
+        example["attention_mask"] = attention_mask
+        example["position_ids"] = position_ids
+        example["raw_prompt_ids"] = raw_prompt_ids
+        example["ground_truth"] = example.pop(self.answer_key)
+        return example
