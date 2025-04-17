@@ -65,6 +65,7 @@ class FunctionRewardManager:
         self.score_fn = partial(score_fn, **self.config.score_function_kwargs)
 
     def __call__(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
+        already_print = 0
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_metrics = defaultdict(list)
         for i in range(len(data)):
@@ -83,5 +84,12 @@ class FunctionRewardManager:
             reward_tensor[i, valid_response_length - 1] = score["overall"]
             for key, value in score.items():
                 reward_metrics[key].append(value)
+            
+            if already_print < 1:
+                already_print += 1
+                print("[response]", response_str)
+                print("[ground_truth]", ground_truth)
+                print("[score]", score)
+                print("[response_length]", valid_response_length.item())
 
         return reward_tensor, reward_metrics
